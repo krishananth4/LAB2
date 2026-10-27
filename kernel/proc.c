@@ -5,6 +5,7 @@
 #include "spinlock.h"
 #include "proc.h"
 #include "defs.h"
+#include "limits.h"
 
 struct cpu cpus[NCPU];
 
@@ -124,6 +125,10 @@ allocproc(void)
 found:
   p->pid = allocpid();
   p->state = USED;
+  p->tickets = 10000;
+  p->ticks = 0;
+  p->stride = 10000/p->tickets;
+  p->pass = p->stride;
 
   // Allocate a trapframe page.
   if((p->trapframe = (struct trapframe *)kalloc()) == 0){
@@ -169,6 +174,10 @@ freeproc(struct proc *p)
   p->killed = 0;
   p->xstate = 0;
   p->state = UNUSED;
+  p->tickets = 0;
+  p->ticks = 0;
+  p->stride = 0;
+  p->pass = 0;
 }
 
 // Create a user page table for a given process, with no user memory,
@@ -434,6 +443,15 @@ wait(uint64 addr)
   }
 }
 
+// pseudo random generator (https://stackoverflow.com/a/7603688)
+unsigned short lfsr = 0xACE1u;
+unsigned short bit;
+unsigned short rand()
+{
+bit = ((lfsr >> 0) ^ (lfsr >> 2) ^ (lfsr >> 3) ^ (lfsr >> 5)) & 1;
+return lfsr = (lfsr >> 1) | (bit << 15);
+}
+
 // Per-CPU process scheduler.
 // Each CPU calls scheduler() after setting itself up.
 // Scheduler never returns.  It loops, doing:
@@ -455,6 +473,88 @@ scheduler(void)
     intr_on();
 
     int found = 0;
+
+#if defined(LOTTERY)
+    int total_tickets = 0;
+    int winning_ticket;
+    for (p = proc; p < &proc[NPROC]; p++)
+    {
+      acquire(&p->lock);
+      if (p->state == RUNNABLE)
+      {
+        total_tickets += p->tickets;
+      }
+      release(&p->lock);
+    }
+
+    if (total_tickets > 0)
+    {
+      winning_ticket = rand() % total_tickets;
+    }
+
+    int ticket_cnt = 0;
+
+    if (total_tickets > 0)
+    {
+      for (p = proc; p < &proc[NPROC]; p++)
+      {
+        acquire(&p->lock);
+        if (p->state == RUNNABLE)
+        {
+          if ((winning_ticket >= ticket_cnt) && (winning_ticket < (ticket_cnt + p->tickets)))
+          {
+            p->state = RUNNING;
+            c->proc = p;
+            p->ticks++;
+            swtch(&c->context, &p->context);
+            c->proc = 0;
+            found = 1;
+            release(&p->lock);
+            break;
+          }
+          ticket_cnt += p->tickets;
+        }
+        release(&p->lock);
+      }
+    }
+#elif defined(STRIDE)
+    int smallest_pass = INT_MAX;
+    struct proc *selected_proc = 0;
+    for (p = proc; p < &proc[NPROC]; p++)
+    {
+      acquire(&p->lock);
+      if (p->state == RUNNABLE)
+      {
+        if (p->pass < smallest_pass)
+        {
+          smallest_pass = p->pass;
+          selected_proc = p;
+        }
+      }
+      release(&p->lock);
+    }
+
+    if (selected_proc)
+    {
+      acquire(&selected_proc->lock);
+      if (selected_proc->state == RUNNABLE)
+      {
+        selected_proc->state = RUNNING;
+        c->proc = selected_proc;
+        selected_proc->ticks++;
+        swtch(&c->context, &selected_proc->context);
+        selected_proc->pass += selected_proc->stride;
+        c->proc = 0;
+        found = 1;
+        release(&selected_proc->lock);
+      }
+      else
+      {
+        release(&selected_proc->lock);
+      }
+    }
+
+#else
     for(p = proc; p < &proc[NPROC]; p++) {
       acquire(&p->lock);
       if(p->state == RUNNABLE) {
@@ -463,6 +563,7 @@ scheduler(void)
         // before jumping back to us.
         p->state = RUNNING;
         c->proc = p;
+        p->ticks++;
         swtch(&c->context, &p->context);
 
         // Process is done running for now.
@@ -472,11 +573,13 @@ scheduler(void)
       }
       release(&p->lock);
     }
+#endif
     if(found == 0) {
       // nothing to run; stop running on this core until an interrupt.
       intr_on();
       asm volatile("wfi");
     }
+
   }
 }
 
@@ -693,3 +796,40 @@ procdump(void)
     printf("\n");
   }
 }
+
+int
+sched_statistics(void)
+{
+  struct proc *p;
+
+  for (p = proc; p < &proc[NPROC]; p++)
+  {
+    acquire(&p->lock);
+    if (p->state != UNUSED)
+    {
+      printf("%d(%s): tickets: %d, ticks: %d\n", p->pid, p->name, p->tickets, p->ticks);
+    }
+    release(&p->lock);
+  }
+  return 0;
+}
+
+int sched_tickets(int tickets)
+{
+  if (tickets < 1 || tickets > 10000)
+  {
+    return 0;
+  }
+  struct proc *p = myproc();
+
+
+  // Critical Section
+  acquire(&p->lock);
+  p->stride = 10000/tickets;
+  p->pass = p->stride;
+  p->tickets = tickets;
+  release(&p->lock);
+
+  return 0;
+}
+
